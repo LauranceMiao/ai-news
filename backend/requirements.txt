@@ -1,0 +1,35 @@
+# Web 框架
+fastapi==0.162.0
+uvicorn==0.54.0
+
+# 数据库
+SQLAlchemy==2.1.8
+aiomysql==0.3.2
+PyMySQL==1.2.3
+cryptography==50.0.2
+
+# 配置
+pydantic-settings==2.16.2
+python-dotenv==1.2.4
+
+# 鉴权
+PyJWT==2.15.1
+passlib==1.7.4
+bcrypt==4.0.1
+python-multipart==0.0.33
+
+# 模型调用 / 网络
+httpx==0.28.1
+
+# 向量检索（本地 bge，无需外部 API）
+fastembed==0.9.1
+onnxruntime==1.31.1
+tokenizers==0.23.3
+numpy==2.5.4
+
+# RSS 采集
+feedparser==6.0.14
+
+# 测试
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
