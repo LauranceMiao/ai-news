@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import AsyncIterator, Optional
 
@@ -23,11 +24,20 @@ from services.llm_client import LLMError, llm_client
 
 logger = logging.getLogger(__name__)
 
-MAX_STEPS = 3              # 最多几轮工具规划
-MAX_TOOL_CALLS = 5         # 一次问答最多执行几个工具
-PLAN_TIMEOUT = 20          # 规划阶段总超时（秒）
+MAX_STEPS = 3              # 普通问答最多几轮规划
+MAX_STEPS_TASK = 3         # 任务模式最多几轮规划
+MAX_TOOL_CALLS = 4         # 普通问答最多执行几个工具
+MAX_TOOL_CALLS_TASK = 4    # 任务模式最多执行几个工具
+PLAN_TIMEOUT = 30          # 规划阶段总超时（秒）
 MAX_FINAL_REFS = 8         # 最终回答最多带几条资料
 
+def _budget_hint(remaining: int) -> str:
+    """在工具结果后附上剩余预算，让模型自己判断该不该收尾。"""
+    if remaining <= 0:
+        return " [hint] 工具调用次数已用尽，必须立即调用 finish_answer 结束检索并作答。"
+    if remaining == 1:
+        return " [hint] 只剩 1 次工具调用，除非关键信息缺失，否则立即调用 finish_answer。"
+    return f" [hint] 还剩 {remaining} 次工具调用；信息已够用时请立即调用 finish_answer，不要继续搜索。"
 # 命中这些词说明问题需要多步：对比、逐条、深挖、换词再搜
 AGENT_HINTS = (
     "对比", "比较", "分别", "各自", "都有哪些", "哪些方面", "详细讲", "展开", "深入",
@@ -99,15 +109,39 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_answer",
+            "description": "当已收集到的资料足以回答问题、或已经确认站内没有相关内容时调用，"
+                           "表示结束检索并进入作答。调用后不会再检索。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "一句话说明为什么可以停了，例如「已覆盖科技、财经两方面」"}
+                },
+                "required": ["reason"],
+            },
+        },
+    },
 ]
 
 AGENT_SYSTEM = (
     "你是一个可以用工具的新闻助手。你可以调用工具检索站内新闻，规则：\n"
-    "1. 先用 search_news 找资料；如果结果不相关或不够，换更具体的关键词再搜，但不要重复同样的搜索。\n"
-    "2. 资料足够就直接回答，不要为了用工具而用工具。\n"
+    "1. 先用 search_news 找资料；结果不相关或为空时换同义或更具体的关键词再搜，不要重复同一查询。\n"
+    "2. 资料足够就调用 finish_answer 结束检索。通常 1-2 次搜索即可，最多 2 轮检索，之后必须 finish_answer。\n"
     "3. 回答必须基于工具返回的资料，引用时用 [1][2] 编号（编号对应资料顺序），不许编造。\n"
     "4. 每条资料都有发布时间，用户问「最新」时优先用日期最新的，并说明日期。\n"
     "5. 如果确实找不到，明确说「站内没有相关报道」，不要硬编。"
+)
+
+TASK_SYSTEM = (
+    "你是一个可以调用工具的新闻研究助手，用户会给你一个「任务」而不是简单问题。规则：\n"
+    "1. 先把任务拆成 2-4 个要查的方面（心里规划即可，不必输出）。\n"
+    "2. 针对每个方面调用 search_news（关键词要具体，避免重复查询），最多 3 轮检索，之后必须 finish_answer。\n"
+    "3. 资料覆盖任务要求后，调用 finish_answer 结束检索，理由里写清覆盖了哪些方面。\n"
+    "4. 最终输出要结构化：先一句结论，再分点列出条目，每条句末用 [1][2] 标注来源编号。\n"
+    "5. 只使用工具返回的资料，不许编造；资料不足时明确说明缺什么。"
 )
 
 
@@ -128,7 +162,7 @@ class AgentRunner:
         published = news.publish_time.strftime("%Y-%m-%d") if news.publish_time else ""
         if news.id in self.refs:
             if excerpt and len(excerpt) > len(self.refs[news.id].get("excerpt") or ""):
-                self.refs[news.id]["excerpt"] = excerpt[:400]
+                self.refs[news.id]["excerpt"] = excerpt[:300]
             return
         self.refs[news.id] = {
             "newsId": news.id,
@@ -136,7 +170,7 @@ class AgentRunner:
             "publishTime": published,
             "score": round(float(score), 4) if score is not None else 0.5,
             "image": news.image,
-            "excerpt": (excerpt or news.description or "")[:400],
+            "excerpt": (excerpt or news.description or "")[:300],
         }
 
     async def _search_news(self, query: str, limit: int = 5) -> list[dict]:
@@ -153,6 +187,8 @@ class AgentRunner:
             news = (await self.db.execute(select(News).where(News.id == hit["newsId"]))).scalar_one_or_none()
             if news:
                 self._add_ref(news, hit.get("score"), excerpt=hit.get("content"))
+        if not rows:
+            return [{"hint": "没有检索到结果，请换更具体或同义的关键词重试，不要重复同一查询"}]
         return rows
 
     async def _get_detail(self, news_id: int) -> dict:
@@ -279,43 +315,140 @@ class AgentRunner:
         self.usage_total["totalTokens"] += usage.total_tokens
         self.usage_total["cost"] += usage.cost
 
+    async def _ask_finish(self, messages: list[dict]) -> str:
+        """预算用尽后，强制模型做一次终止判断，返回它给出的理由。"""
+        finish_tool = [tool for tool in TOOLS
+                       if tool["function"]["name"] == "finish_answer"]
+        try:
+            resp = await llm_client.chat(
+                messages + [{"role": "user",
+                             "content": "工具预算已用尽，请判断现有资料是否足以回答问题，并调用 finish_answer 说明理由。"}],
+                task="chat", tools=finish_tool,
+                max_tokens=150, temperature=0.2,
+            )
+        except LLMError as exc:
+            logger.warning("终止判断失败：%s", exc)
+            return ""
+        self._accumulate(resp.usage)
+        for call in resp.tool_calls:
+            if call["function"]["name"] == "finish_answer":
+                try:
+                    args = json.loads(call["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    return "资料已足够"
+                return str(args.get("reason") or "资料已足够")
+        return ""
+
     # ---------- 主流程 ----------
-    async def run(self, question: str, history: Optional[list[dict]] = None) -> AsyncIterator[dict]:
+    @staticmethod
+    def _sanitize_citations(text: str, max_ref: int) -> tuple[str, list[int]]:
+        """校验引用编号：超出参考范围的 [n] 直接剔除，避免指向不存在的资料。"""
+        bad: set[int] = set()
+
+        def repl(match):
+            number = int(match.group(1))
+            if 1 <= number <= max_ref:
+                return match.group(0)
+            bad.add(number)
+            return ""
+
+        return re.sub(r"\[(\d{1,2})\]", repl, text), sorted(bad)
+
+    async def run(self, question: str, history: Optional[list[dict]] = None,
+                  task_mode: bool = False) -> AsyncIterator[dict]:
         started = time.perf_counter()
-        messages: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}]
+        max_steps = MAX_STEPS_TASK if task_mode else MAX_STEPS
+        max_calls = MAX_TOOL_CALLS_TASK if task_mode else MAX_TOOL_CALLS
+        system_prompt = (TASK_SYSTEM if task_mode else AGENT_SYSTEM) + f"\n本次最多可调用 {max_calls} 次工具，每次搜索会返回 5 条标题，通常已足够，请节约调用。"
+
+        messages: list[dict] = [{"role": "system", "content": system_prompt}]
         for item in (history or [])[-4:]:
             if item.get("role") in ("user", "assistant") and item.get("content"):
                 messages.append({"role": item["role"], "content": item["content"][:500]})
         messages.append({"role": "user", "content": question})
 
         direct_answer = ""
-        for step_no in range(1, MAX_STEPS + 1):
+        finish_reason = ""
+        for round_index in range(1, max_steps + 1):
             if time.perf_counter() - started > PLAN_TIMEOUT:
+                finish_reason = "规划超时，使用已有资料作答"
                 logger.info("Agent 规划超时，提前作答")
                 break
 
-            try:
-                resp = await llm_client.chat(messages, task="chat", tools=TOOLS,
-                                             max_tokens=450, temperature=0.2)
-            except LLMError:
-                raise
+            resp = await llm_client.chat(messages, task="chat", tools=TOOLS,
+                                         max_tokens=450, temperature=0.2)
             self._accumulate(resp.usage)
 
             if not resp.tool_calls:
                 direct_answer = resp.content
+                finish_reason = "模型直接作答"
                 break
 
-            messages.append({
+            # 只保留真正会执行的工具调用：assistant 消息里的 tool_calls
+            # 必须与后续 tool 消息一一对应，否则 DeepSeek 会报 400
+            finish_calls = [c for c in resp.tool_calls
+                            if c["function"]["name"] == "finish_answer"]
+            calls = [finish_calls[0]] if finish_calls else resp.tool_calls[:2]
+
+            assistant_msg = {
                 "role": "assistant",
                 "content": resp.content or "",
-                "tool_calls": resp.tool_calls,
-            })
-            for call in resp.tool_calls[:3]:
-                if self.tool_calls >= MAX_TOOL_CALLS:
-                    break
+                "tool_calls": calls,
+            }
+            # 思考模式要求把 reasoning_content 一并回传，否则下一次调用会 400
+            if resp.reasoning:
+                assistant_msg["reasoning_content"] = resp.reasoning
+            messages.append(assistant_msg)
+
+            # 模型显式调用 finish_answer：认为资料已足够，结束检索
+            if finish_calls:
+                try:
+                    args = json.loads(finish_calls[0]["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                finish_reason = str(args.get("reason") or "资料已足够")
+                step = {
+                    "step": len(self.steps) + 1,
+                    "tool": "finish_answer",
+                    "args": args,
+                    "count": 0,
+                    "latencyMs": 0,
+                    "text": f"判断可以作答：{finish_reason}",
+                }
+                self.steps.append(step)
+                yield {"type": "step", **step}
+                break
+
+            for call in calls:
+                if self.tool_calls >= max_calls:
+                    # 预算用尽也要回一条 tool 消息，保证 tool_calls 有对应响应
+                    messages.append({"role": "tool", "tool_call_id": call["id"],
+                                     "content": '{"skipped": true, "reason": "工具调用次数已达上限"}'})
+                    continue
                 result, _ = await self._execute(call)
-                messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+                messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": result + _budget_hint(max_calls - self.tool_calls)})
                 yield {"type": "step", **self.steps[-1]}
+
+            # 工具预算刚好用尽：单独问一次「现在能不能作答」，
+            # 让终止理由由模型给出，而不是硬编码的“达到上限”
+            if self.tool_calls >= max_calls or round_index >= max_steps:
+                reason = await self._ask_finish(messages) or "预算用尽，使用已有资料作答"
+                if reason:
+                    finish_reason = reason
+                    step = {
+                        "step": len(self.steps) + 1,
+                        "tool": "finish_answer",
+                        "args": {"reason": reason},
+                        "count": 0,
+                        "latencyMs": 0,
+                        "text": f"判断可以作答：{reason}",
+                    }
+                    self.steps.append(step)
+                    yield {"type": "step", **step}
+                break
+        else:
+            finish_reason = "达到步数上限，使用已有资料作答"
 
         refs = list(self.refs.values())[:MAX_FINAL_REFS]
         yield {"type": "refs", "refs": refs}
@@ -358,10 +491,28 @@ class AgentRunner:
             self.usage_total["totalTokens"] += final_usage.get("totalTokens", 0)
             self.usage_total["cost"] += final_usage.get("cost", 0)
 
-        if not "".join(collected).strip():
-            yield {"type": "delta", "content": "抱歉，这次没能整理出答案，请换个问法再试。"}
+        answer = "".join(collected)
+        if not answer.strip():
+            answer = "抱歉，这次没能整理出答案，请换个问法再试。"
+            yield {"type": "delta", "content": answer}
 
-        yield {"type": "done", "usage": self._usage_dict(), "steps": self.steps}
+        # 引用校验：把指向不存在资料的 [n] 去掉，并告知前端替换正文
+        fixed, bad_refs = self._sanitize_citations(answer, len(refs))
+        if bad_refs:
+            answer = fixed
+            yield {
+                "type": "fix",
+                "content": fixed,
+                "notice": f"已移除 {len(bad_refs)} 处无效引用（[{', '.join(map(str, bad_refs))}]）",
+            }
+
+        yield {
+            "type": "done",
+            "usage": self._usage_dict(),
+            "steps": self.steps,
+            "answer": answer,
+            "finishReason": finish_reason,
+        }
 
     def _usage_dict(self) -> dict:
         return {

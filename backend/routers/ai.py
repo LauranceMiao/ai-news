@@ -19,7 +19,7 @@ from models.users import User
 from schemas.ai import ChatRequest, SummaryRequest
 from services import digest as digest_service
 from services import rag
-from services.agent import AgentRunner, should_use_agent
+from services.agent import AgentRunner
 from services.cache import cache
 from services.embeddings import EmbeddingError
 from services.llm_client import LLMError, llm_client
@@ -130,7 +130,8 @@ async def ai_chat(body: ChatRequest,
                   user: Optional[User] = Depends(get_optional_user)):
     started = time.perf_counter()
 
-    use_agent = mode == "agent" or (mode == "auto" and should_use_agent(body.question))
+    # auto / agent / task 都走 Agent 循环；只有显式 mode=rag 才用单次检索
+    use_agent = mode != 'rag'
 
     try:
         hits = await rag.search(db, body.question, news_id=body.newsId)
@@ -166,6 +167,8 @@ async def ai_chat(body: ChatRequest,
         usage = None
         steps: list[dict] = []
         final_refs = refs
+        final_answer_override: Optional[str] = None
+        finish_reason = ""
 
         yield _sse({"type": "meta", "sessionId": session_id, "refs": refs,
                     "mode": "agent" if use_agent else "rag"})
@@ -173,10 +176,14 @@ async def ai_chat(body: ChatRequest,
         if use_agent:
             runner = AgentRunner(db, news_id=body.newsId)
             try:
-                async for event in runner.run(body.question, body.history):
+                async for event in runner.run(body.question, body.history, task_mode=body.taskMode):
                     etype = event["type"]
                     if etype == "delta":
                         answer_parts.append(event["content"])
+                        yield _sse(event)
+                    elif etype == "fix":
+                        # 引用校验后的正文替换
+                        final_answer_override = event.get("content")
                         yield _sse(event)
                     elif etype == "step":
                         steps.append(event)
@@ -187,13 +194,16 @@ async def ai_chat(body: ChatRequest,
                         yield _sse(event)
                     elif etype == "done":
                         usage = event.get("usage")
+                        finish_reason = event.get("finishReason", "")
+                        if event.get("answer"):
+                            final_answer_override = event["answer"]
                         yield _sse({**event, "refs": final_refs, "sessionId": session_id})
-                logger.info("Agent 完成：%s 步，%s", len(steps), usage)
+                logger.info("Agent 完成：%s 步，停止原因=%s，%s", len(steps), finish_reason, usage)
             except Exception as exc:
                 # 任何异常都回退到单次 RAG，避免比原来更差
                 logger.warning("Agent 执行失败，回退单次 RAG：%s", exc)
                 steps = []
-                yield _sse({"type": "notice", "message": "已切换为快速模式"})
+                yield _sse({"type": "notice", "message": "多步检索失败，已切换为快速模式"})
                 async for chunk in llm_client.stream(messages, task="chat"):
                     if chunk["type"] == "delta":
                         answer_parts.append(chunk["content"])
@@ -216,7 +226,7 @@ async def ai_chat(body: ChatRequest,
                 yield "data: [DONE]\n\n"
                 return
 
-        answer = "".join(answer_parts)
+        answer = final_answer_override if final_answer_override is not None else "".join(answer_parts)
         if not answer.strip():
             answer = "抱歉，模型这次没有返回正文（可能思考过长被截断），请换个问法再试一次。"
             yield _sse({"type": "delta", "content": answer})
@@ -238,7 +248,8 @@ async def ai_chat(body: ChatRequest,
             logger.warning("保存会话失败：%s", exc)
 
         yield _sse({"type": "done", "usage": usage, "latencyMs": latency,
-                    "refs": final_refs, "sessionId": session_id, "steps": steps})
+                    "refs": final_refs, "sessionId": session_id, "steps": steps,
+                    "answer": answer, "finishReason": finish_reason})
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

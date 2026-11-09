@@ -75,12 +75,20 @@
       </div>
 
       <div class="input-container">
+        <button
+          class="task-toggle"
+          :class="{ on: taskMode }"
+          :title="taskMode ? '任务模式：会先拆解任务再检索' : '问答模式'"
+          @click="taskMode = !taskMode"
+        >
+          {{ taskMode ? '任务' : '问答' }}
+        </button>
         <van-field
           v-model="userInput"
           rows="1"
           autosize
           type="textarea"
-          placeholder="问我最近发生了什么..."
+          :placeholder="taskMode ? '描述一个任务，如：整理本周 AI 芯片动态并列出出处' : '问我最近发生了什么...'"
           class="chat-input"
           @keypress.enter.prevent="sendMessage"
         />
@@ -116,6 +124,7 @@ const messages = computed({
   get: () => chat.messages,
   set: (value) => { chat.messages = value; }
 });
+const taskMode = ref(false);
 const sessionId = computed({
   get: () => chat.sessionId,
   set: (value) => { chat.sessionId = value; }
@@ -231,7 +240,7 @@ const sendMessage = async () => {
     const response = await fetch(aiConfig.chat, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ question, sessionId: sessionId.value }),
+      body: JSON.stringify({ question, sessionId: sessionId.value, taskMode: taskMode.value }),
     });
 
     if (!response.ok || !response.body) {
@@ -279,7 +288,11 @@ const sendMessage = async () => {
           aiMessage.content += event.content;
           await nextTick();
           scrollToBottom();
+        } else if (event.type === 'fix') {
+          aiMessage.content = event.content || aiMessage.content;
+          if (event.notice) aiMessage.notice = event.notice;
         } else if (event.type === 'done') {
+          if (event.answer) aiMessage.content = event.answer;
           aiMessage.usage = event.usage;
           aiMessage.refs = event.refs || aiMessage.refs;
           aiMessage.latencyMs = event.latencyMs;
@@ -598,4 +611,24 @@ const sendMessage = async () => {
 }
 .md-body { color: var(--text); }
 .usage, .refs-title { color: var(--text-faint) !important; }
+.task-toggle {
+  flex-shrink: 0;
+  align-self: flex-end;
+  height: 40px;
+  padding: 0 12px;
+  margin-right: 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.task-toggle.on {
+  border-color: var(--brand);
+  color: var(--brand);
+  background: rgba(46, 230, 200, 0.1);
+}
 </style>

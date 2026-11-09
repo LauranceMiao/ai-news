@@ -13,6 +13,7 @@ class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000, description="用户问题")
     sessionId: Optional[int] = Field(None, description="会话ID，为空则新建")
     newsId: Optional[int] = Field(None, description="限定在某篇新闻内提问")
+    taskMode: bool = Field(False, description="任务模式：把问题当成任务来拆解与检索")
     history: Optional[list[dict]] = Field(None, description="前端回传的上下文（可选）")
 
 
